@@ -1,0 +1,31 @@
+﻿【岗位名称】运维开发实习生（DevOps方向）
+【公司】云澜科技有限公司
+【工作地点】深圳·南山区
+【薪资范围】250-350元/天
+【岗位类型】实习（每周至少4天，实习期4个月以上）
+
+【岗位职责】
+1. 参与公司云原生基础设施的建设和日常运维
+2. 使用Kubernetes/Docker进行服务编排和容器化管理
+3. 搭建监控告警体系（Prometheus+Grafana+AlertManager）
+4. 参与CI/CD流水线（GitLab CI/ArgoCD）的优化和维护
+5. 编写运维自动化脚本（Python/Bash），提升运维效率
+
+【任职要求】
+1. 本科及以上学历，计算机相关专业
+2. 熟悉Linux操作系统，有Shell脚本编写能力
+3. 了解Docker和Kubernetes基础概念
+4. 了解至少一种监控系统（Prometheus/Zabbix/Nagios）
+5. 了解至少一种CI/CD工具（Jenkins/GitLab CI/GitHub Actions）
+6. 对SRE和DevOps文化有认同感
+
+【加分项】
+- 了解Terraform/IaC基础设施即代码
+- 有公有云使用经验（AWS/阿里云/腾讯云）
+- 有开源社区贡献
+
+【我们提供】
+- 参与大规模分布式系统运维实战
+- 资深SRE专家1v1指导
+- 免费三餐+技术书籍报销
+- 表现优异可获高薪转正offer

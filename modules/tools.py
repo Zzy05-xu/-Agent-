@@ -14,6 +14,7 @@ Agent 工具函数模块
 import json
 import os
 import re
+import time, threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,33 @@ from config.logger import get_logger
 from config.settings import get_llm, APPLICATIONS_CSV
 from modules.rag_knowledge import search_knowledge
 
+
+# ================================================================
+# TTL cache (reduce duplicate API calls)
+# ================================================================
+
+_ttl_cache = {}
+_CACHE_TTL = 300
+
+def _cache_key(prefix: str, text: str) -> str:
+    return f"{prefix}:{text[:200]}"
+
+def _cache_get(key: str):
+    if key in _ttl_cache:
+        val, ts = _ttl_cache[key]
+        if __import__("time").time() - ts < _CACHE_TTL:
+            return val
+        del _ttl_cache[key]
+    return None
+
+def _cache_set(key: str, value):
+    _ttl_cache[key] = (value, __import__("time").time())
+    if len(_ttl_cache) > 200:
+        old = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][1])[:100]
+        for k in old:
+            _ttl_cache.pop(k, None)
+
+_csv_lock = __import__("threading").Lock()
 # ═══════════════════════════════════════════════════════════════
 # 工具 1：岗位检索
 # ═══════════════════════════════════════════════════════════════
@@ -34,8 +62,13 @@ def _job_search(query: str) -> str:
     """
     从 JD 知识库中检索匹配的实习岗位。
     输入: 关键词或岗位要求描述
-    输出: Top3 最匹配的 JD 信息
+    输出: 去重后的 Top 匹配 JD 信息
     """
+    ck = _cache_key("js", query)
+    ch = _cache_get(ck)
+    if ch is not None:
+        return ch
+
     from modules.rag_knowledge import load_vector_store
     from config.settings import VECTOR_STORE_DIR
 
@@ -55,7 +88,23 @@ def _job_search(query: str) -> str:
     if not results or "检索异常" in results[0].get("content", ""):
         return "❌ 未找到匹配的岗位信息，请尝试调整关键词后重试。"
 
-    output_parts = ["📋 **岗位检索结果（Top 3）**\n"]
+    seen_sources = set()
+    seen_contents = set()
+    unique_results = []
+    for item in results:
+        src = item["source"]
+        src_file = src.split("/")[-1] if "/" in src else src
+        ck2 = item["content"][:80].strip()
+        if src_file not in seen_sources and ck2 not in seen_contents:
+            seen_sources.add(src_file)
+            seen_contents.add(ck2)
+            unique_results.append(item)
+    results = unique_results
+
+    if not results:
+        return "❌ 未找到匹配的岗位信息，请尝试调整关键词后重试。"
+
+    output_parts = [f"📋 **岗位检索结果（Top {len(results)}）**\n"]
     for i, item in enumerate(results, 1):
         output_parts.append(
             f"---\n"
@@ -63,7 +112,9 @@ def _job_search(query: str) -> str:
             f"{item['content']}\n"
         )
 
-    return "\n".join(output_parts)
+    result = "\n".join(output_parts)
+    _cache_set(ck, result)
+    return result
 
 
 job_search_tool = Tool(
@@ -493,6 +544,11 @@ def _interview_question(target: str) -> str:
     except (FileNotFoundError, RuntimeError):
         pass
 
+    ck = _cache_key("iv", target)
+    ch = _cache_get(ck)
+    if ch is not None:
+        return ch
+
     if not target.strip():
         return "❌ 请提供目标公司和岗位信息，如「字节跳动 数据分析实习」。"
 
@@ -508,7 +564,9 @@ def _interview_question(target: str) -> str:
     except Exception as e:
         return f"❌ LLM 调用失败: {e}"
 
-    return f"🎤 **模拟面试题生成** - {target}\n\n{content}"
+    result = f"🎤 **模拟面试题生成** - {target}\n\n{content}"
+    _cache_set(ck, result)
+    return result
 
 
 interview_question_tool = Tool(
