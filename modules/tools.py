@@ -1,15 +1,15 @@
-﻿"""
-Agent 工具函数模块
-基于 LangChain Tool 类规范封装 6 个专业求职辅助工具。
-所有工具输入为字符串，输出为格式化字符串，完全适配 ReAct Agent 调用。
+"""
+Agent ���ߺ���ģ��
+���� LangChain Tool ��淶��װ 6 ��רҵ��ְ�������ߡ�
+���й�������Ϊ�ַ��������Ϊ��ʽ���ַ�������ȫ���� ReAct Agent ���á�
 
-工具清单：
-1. job_search_tool      - 岗位检索（RAG检索JD知识库）
-2. resume_parse_tool    - 简历解析（PDF文本提取+结构化）
-3. resume_match_tool    - 简历匹配评分（LLM评估）
-4. resume_optimize_tool - 简历优化（STAR法则改写）
-5. interview_question_tool - 面试题生成（RAG+LLM）
-6. application_tracker_tool - 投递进度管理（CSV增删改查）
+�����嵥��
+1. job_search_tool      - ��λ������RAG����JD֪ʶ�⣩
+2. resume_parse_tool    - ����������PDF�ı���ȡ+�ṹ����
+3. resume_match_tool    - ����ƥ�����֣�LLM������
+4. resume_optimize_tool - �����Ż���STAR�����д��
+5. interview_question_tool - ���������ɣ�RAG+LLM��
+6. application_tracker_tool - Ͷ�ݽ��ȹ����CSV��ɾ�Ĳ飩
 """
 import json
 import os
@@ -36,33 +36,95 @@ _ttl_cache = {}
 _CACHE_TTL = 300
 
 def _cache_key(prefix: str, text: str) -> str:
-    return f"{prefix}:{text[:200]}"
+    return "{0}:{1}".format(prefix, hash(text))
 
 def _cache_get(key: str):
     if key in _ttl_cache:
         val, ts = _ttl_cache[key]
-        if __import__("time").time() - ts < _CACHE_TTL:
+        if time.time() - ts < _CACHE_TTL:
             return val
         del _ttl_cache[key]
     return None
 
 def _cache_set(key: str, value):
-    _ttl_cache[key] = (value, __import__("time").time())
+    _ttl_cache[key] = (value, time.time())
     if len(_ttl_cache) > 200:
         old = sorted(_ttl_cache, key=lambda k: _ttl_cache[k][1])[:100]
         for k in old:
             _ttl_cache.pop(k, None)
 
-_csv_lock = __import__("threading").Lock()
-# ═══════════════════════════════════════════════════════════════
-# 工具 1：岗位检索
-# ═══════════════════════════════════════════════════════════════
+_csv_lock = threading.Lock()
+
+# ── 向量库存储名称 ──
+JD_STORE_NAME = "jd_store"
+
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+
+def _llm_rerank(query: str, candidates: list, top_k: int = 3) -> list:
+    """LLM Re-Ranking: FAISS coarse �� LLM fine scoring �� Top K.
+    
+    Solves: FAISS L2 distance has limited Chinese semantic discrimination.
+    Two unrelated JDs can appear close in vector space.
+    LLM truly understands semantics for precise filtering.
+    """
+    if len(candidates) <= top_k:
+        return candidates
+
+    logger = get_logger(__name__)
+    try:
+        candidate_text = ""
+        for i, item in enumerate(candidates, 1):
+            src = item.get("source", "unknown")
+            content = item["content"][:600]
+            candidate_text += "\n### CANDIDATE {0}\nSource: {1}\nContent: {2}\n".format(i, src, content)
+
+        rerank_prompt = (
+            'You are a hiring expert. User is searching for internship positions with query: "' + query + '".\n\n'
+            + 'Here are ' + str(len(candidates)) + ' candidate job descriptions. Score each (1-10) on relevance to the query.\n\n'
+            + candidate_text + '\n'
+            + 'Output STRICT JSON only:\n'
+            + '{"rankings": [{"index": 1, "score": 8, "reason": "brief"}], "top_indices": [3, 1, 5]}\n'
+            + 'top_indices lists candidate numbers from highest to lowest score.'
+        )
+
+        from config.settings import invoke_llm_with_retry
+        response = invoke_llm_with_retry(rerank_prompt, temperature=0.1, max_tokens=1024, max_retries=2)
+        parsed = _extract_json(response)
+
+        if "parse_error" in parsed:
+            logger.warning("Re-Ranking JSON parse failed, fallback to FAISS order")
+            return candidates[:top_k]
+
+        top_indices = parsed.get("top_indices", [])
+        if not top_indices:
+            return candidates[:top_k]
+
+        reranked = []
+        seen = set()
+        for idx in top_indices:
+            if isinstance(idx, int) and 1 <= idx <= len(candidates) and idx not in seen:
+                seen.add(idx)
+                reranked.append(candidates[idx - 1])
+
+        for i, cand in enumerate(candidates, 1):
+            if i not in seen and len(reranked) < top_k:
+                reranked.append(cand)
+
+        logger.info("Re-Ranking: {0} -> {1} results".format(len(candidates), len(reranked)))
+        return reranked[:top_k]
+
+    except Exception as e:
+        logger.warning("Re-Ranking failed ({0}), fallback to FAISS order".format(e))
+        return candidates[:top_k]
+
+# ���� 1����λ����
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
 def _job_search(query: str) -> str:
     """
-    从 JD 知识库中检索匹配的实习岗位。
-    输入: 关键词或岗位要求描述
-    输出: 去重后的 Top 匹配 JD 信息
+    �� JD ֪ʶ���м���ƥ���ʵϰ��λ��
+    ����: �ؼ��ʻ��λҪ������
+    ���: ȥ�غ�� Top ƥ�� JD ��Ϣ
     """
     ck = _cache_key("js", query)
     ch = _cache_get(ck)
@@ -72,21 +134,21 @@ def _job_search(query: str) -> str:
     from modules.rag_knowledge import load_vector_store
     from config.settings import VECTOR_STORE_DIR
 
-    jd_store_path = os.path.join(str(VECTOR_STORE_DIR), "jd_store")
+    jd_store_path = os.path.join(str(VECTOR_STORE_DIR), JD_STORE_NAME)
     
     try:
         vector_store = load_vector_store(jd_store_path)
     except (FileNotFoundError, RuntimeError) as e:
         return (
-            f"⚠️ 知识库未就绪：{e}\n\n"
-            "📌 请先在侧边栏「知识库管理」中点击「构建知识库」，"
-            "将 JD 和面经文档索引到向量库中。"
+            f"?? ֪ʶ��δ������{e}\n\n"
+            "?? �����ڲ������֪ʶ�������е��������֪ʶ�⡹��"
+            "�� JD ���澭�ĵ��������������С�"
         )
 
-    results = search_knowledge(vector_store, query, top_k=3)
+    results = search_knowledge(vector_store, query, top_k=15)
 
-    if not results or "检索异常" in results[0].get("content", ""):
-        return "❌ 未找到匹配的岗位信息，请尝试调整关键词后重试。"
+    if not results or "�����쳣" in results[0].get("content", ""):
+        return "? δ�ҵ�ƥ��ĸ�λ��Ϣ���볢�Ե����ؼ��ʺ����ԡ�"
 
     seen_sources = set()
     seen_contents = set()
@@ -102,13 +164,16 @@ def _job_search(query: str) -> str:
     results = unique_results
 
     if not results:
-        return "❌ 未找到匹配的岗位信息，请尝试调整关键词后重试。"
+        return "? δ�ҵ�ƥ��ĸ�λ��Ϣ���볢�Ե����ؼ��ʺ����ԡ�"
 
-    output_parts = [f"📋 **岗位检索结果（Top {len(results)}）**\n"]
+    # LLM Re-Ranking: FAISS coarse -> LLM fine Top 3
+    results = _llm_rerank(query, results, top_k=3)
+
+    output_parts = [f"?? **��λ���������Top {len(results)}��**\n"]
     for i, item in enumerate(results, 1):
         output_parts.append(
             f"---\n"
-            f"**#{i}** | 📄 来源: {item['source']} | 相似度距离: {item['score']}\n\n"
+            f"**#{i}** | ?? ��Դ: {item['source']} | ���ƶȾ���: {item['score']}\n\n"
             f"{item['content']}\n"
         )
 
@@ -121,62 +186,52 @@ job_search_tool = Tool(
     name="job_search",
     func=_job_search,
     description=(
-        "从实习岗位知识库中检索匹配的岗位信息。"
-        "当你需要帮用户搜索特定方向（如数据分析、后端开发）的实习岗位时，调用此工具。"
-        "输入应为关键词或岗位方向描述，如'数据分析实习 互联网'。"
-        "输出将包含公司名、岗位职责、任职要求、薪资范围等关键信息。"
+        "��ʵϰ��λ֪ʶ���м���ƥ��ĸ�λ��Ϣ��"
+        "������Ҫ���û������ض����������ݷ�������˿�������ʵϰ��λʱ�����ô˹��ߡ�"
+        "����ӦΪ�ؼ��ʻ��λ������������'���ݷ���ʵϰ ������'��"
+        "�����������˾������λְ����ְҪ��н�ʷ�Χ�ȹؼ���Ϣ��"
     ),
 )
 
-# ═══════════════════════════════════════════════════════════════
-# 工具 2：简历解析
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���� 2����������
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
-# ── LLM 简历结构化提取 Prompt ──
-RESUME_PARSE_PROMPT = """你是一位专业的简历解析专家。请从以下简历原文中提取关键信息，并以严格 JSON 格式返回。
+# ���� LLM �����ṹ����ȡ Prompt ����
+RESUME_PARSE_PROMPT = """����һλרҵ�ļ�������ר�ҡ�������¼���ԭ������ȡ�ؼ���Ϣ�������ϸ� JSON ��ʽ���ء�
 
 {resume_text}
 
-请返回如下 JSON 结构（只输出 JSON，不要其他文字）：
+�뷵������ JSON �ṹ��ֻ��� JSON����Ҫ�������֣���
 {{
-    "name": "姓名（如未找到填入空字符串）",
+    "name": "��������δ�ҵ�������ַ�����",
     "education": [
-        {{"school": "学校名", "degree": "学历（本科/硕士/博士）", "major": "专业", "year": "毕业年份"}}
+        {{"school": "ѧУ��", "degree": "ѧ��������/˶ʿ/��ʿ��", "major": "רҵ", "year": "��ҵ���"}}
     ],
-    "skills": ["技能1", "技能2", "技能3"],
+    "skills": ["����1", "����2", "����3"],
     "experience": [
-        {{"company": "公司/组织", "role": "职位", "duration": "时间段", "description": "工作描述摘要"}}
+        {{"company": "��˾/��֯", "role": "ְλ", "duration": "ʱ���", "description": "��������ժҪ"}}
     ],
     "projects": [
-        {{"name": "项目名称", "description": "项目描述摘要", "tech_stack": ["使用技术1"]}}
+        {{"name": "��Ŀ����", "description": "��Ŀ����ժҪ", "tech_stack": ["ʹ�ü���1"]}}
     ]
 }}
 
-如果某个字段无法识别，返回空数组 [] 或空字符串。
+���ĳ���ֶ��޷�ʶ�𣬷��ؿ����� [] ����ַ�����
 """  # noqa: E501
 
 
 def _resume_parse(file_path: str) -> str:
-    """
-    解析 PDF 简历文件，使用 LLM 做结构化信息提取。
-    
-    流程：
-    1. pypdf 逐页提取原始文本
-    2. LLM 分析文本，提取教育背景、技能栈、项目经历
-    3. 返回结构化 Markdown 展示
-    
-    输入: PDF 文件的本地绝对路径
-    输出: 结构化简历文本（Markdown 格式）
-    """
+    """Parse PDF resume, extract structured info via LLM, return Markdown."""
     path = Path(file_path.strip().strip('"'))
     
     if not path.exists():
-        return f"❌ 文件不存在: {file_path}\n请确认路径正确，或先在「简历优化」页面上传文件。"
+        return f"[ERROR] File not found: {file_path}\nPlease check the path or upload in Resume tab."
 
     if path.suffix.lower() != ".pdf":
-        return f"❌ 仅支持 PDF 格式，当前文件类型: {path.suffix}"
+        return f"[ERROR] Only PDF supported, got: {path.suffix}"
 
-    # 第1步：PDF 原始文本提取
+    # Step 1: Extract raw text from PDF
     try:
         reader = PdfReader(str(path))
         full_text_parts = []
@@ -186,156 +241,155 @@ def _resume_parse(file_path: str) -> str:
                 full_text_parts.append(text)
         full_text = "\n".join(full_text_parts)
     except Exception as e:
-        return f"❌ PDF 解析失败: {e}"
+        return f"[ERROR] PDF parse failed: {e}"
 
     if not full_text.strip():
-        return "❌ 该 PDF 文件可能为扫描件或图片格式，未提取到可读文本。"
+        return "[ERROR] PDF may be scanned/image, no readable text extracted."
 
-    # 第2步：LLM 结构化提取（最多分析前 4000 字）
-    text_to_analyze = full_text[:4000]
+    # Step 2: LLM structured extraction (analyze up to 8000 chars for completeness)
+    text_to_analyze = full_text[:8000]
     prompt = RESUME_PARSE_PROMPT.format(resume_text=text_to_analyze)
 
     try:
-        llm = get_llm(temperature=0.1, max_tokens=1024)
+        llm = get_llm(temperature=0.1, max_tokens=1536)
         response = llm.invoke(prompt)
         llm_output = response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        # LLM 解析失败时降级为原始文本展示
+        # Fallback: show raw text
+        preview = full_text[:5000]
         return (
-            f"⚠️ LLM 结构化解析失败: {e}\n\n"
-            f"📝 **简历原始文本预览**（前 3000 字符）:\n\n"
-            f"{full_text[:3000]}"
-            + ("\n...(内容过长已截断)" if len(full_text) > 3000 else "")
+            f"[WARN] LLM structured parse failed: {e}\n\n"
+            f"=== RAW RESUME TEXT (first {min(len(full_text), 5000)} chars) ===\n\n"
+            f"{preview}"
+            + ("\n...(truncated)" if len(full_text) > 5000 else "")
         )
 
-    # JSON 提取
+    # JSON extraction
     parsed = _extract_json(llm_output)
 
-    # 第3步：结构化展示
+    # Step 3: Format structured output
     if "parse_error" in parsed:
-        # JSON 解析失败，降级展示
         return (
-            f"⚠️ LLM 返回格式异常，以下为原始分析结果：\n\n{llm_output}\n\n"
-            f"---\n📝 **简历原文（前 3000 字符）**:\n\n{full_text[:3000]}"
+            f"[WARN] LLM returned invalid format. Raw output:\n\n{llm_output}\n\n"
+            f"---\n=== RAW RESUME TEXT (first 5000 chars) ===\n\n{full_text[:5000]}"
         )
 
-    result_parts = ["📄 **简历智能解析结果**\n"]
+    result_parts = ["=== RESUME PARSED RESULT ===\n"]
 
-    # 姓名
+    # Name
     name = parsed.get("name", "")
     if name:
-        result_parts.append(f"👤 **姓名**: {name}\n")
+        result_parts.append(f"[Name] {name}\n")
 
-    # 教育背景
+    # Education
     edu_list = parsed.get("education", [])
     if edu_list:
-        result_parts.append("---\n🎓 **教育背景**:")
+        result_parts.append("---\n[Education]")
         for edu in edu_list:
             parts = []
             if edu.get("school"): parts.append(edu["school"])
             if edu.get("degree"): parts.append(edu["degree"])
             if edu.get("major"): parts.append(edu["major"])
             if edu.get("year"): parts.append(f"({edu['year']})")
-            result_parts.append(f"  - {' · '.join(parts)}")
+            result_parts.append(f"  - {' | '.join(parts)}")
     else:
-        result_parts.append("---\n🎓 **教育背景**: 未识别")
+        result_parts.append("---\n[Education] Not detected")
 
-    # 技能栈
+    # Skills
     skills = parsed.get("skills", [])
     if skills:
-        result_parts.append("\n---\n🛠 **技能栈**:")
+        result_parts.append("\n---\n[Skills]")
         for s in skills:
             result_parts.append(f"  - {s}")
     else:
-        result_parts.append("\n---\n🛠 **技能栈**: 未识别")
+        result_parts.append("\n---\n[Skills] Not detected")
 
-    # 工作/实习经历
+    # Experience
     exp_list = parsed.get("experience", [])
     if exp_list:
-        result_parts.append("\n---\n💼 **工作/实习经历**:")
+        result_parts.append("\n---\n[Experience]")
         for exp in exp_list:
             company = exp.get("company", "")
             role = exp.get("role", "")
             duration = exp.get("duration", "")
             desc = exp.get("description", "")
-            header = f"{company} — {role}" if company else role
+            header = f"{company} - {role}" if company else role
             if duration: header += f" ({duration})"
             result_parts.append(f"  - **{header}**")
             if desc: result_parts.append(f"    {desc}")
     else:
-        result_parts.append("\n---\n💼 **工作/实习经历**: 未识别")
+        result_parts.append("\n---\n[Experience] Not detected")
 
-    # 项目经历
+    # Projects
     proj_list = parsed.get("projects", [])
     if proj_list:
-        result_parts.append("\n---\n📁 **项目经历**:")
+        result_parts.append("\n---\n[Projects]")
         for proj in proj_list:
             name_p = proj.get("name", "")
             desc_p = proj.get("description", "")
             tech = ", ".join(proj.get("tech_stack", []))
             result_parts.append(f"  - **{name_p}**")
-            if tech: result_parts.append(f"    技术栈: {tech}")
+            if tech: result_parts.append(f"    Tech: {tech}")
             if desc_p: result_parts.append(f"    {desc_p}")
     else:
-        result_parts.append("\n---\n📁 **项目经历**: 未识别")
+        result_parts.append("\n---\n[Projects] Not detected")
 
-    # 完整文本预览（供人工核对）
-    truncated = full_text[:2000]
+    # Full text preview for manual verification
+    preview_len = min(len(full_text), 5000)
     result_parts.append(
-        f"\n---\n📝 **完整文本预览**（前{min(len(full_text), 2000)}字符）:\n{truncated}"
-        + ("\n...(内容过长已截断)" if len(full_text) > 2000 else "")
+        f"\n---\n=== RAW TEXT PREVIEW (first {preview_len} chars) ===\n{full_text[:preview_len]}"
+        + ("\n...(truncated)" if len(full_text) > 5000 else "")
     )
 
     return "\n".join(result_parts)
-
 
 resume_parse_tool = Tool(
     name="resume_parse",
     func=_resume_parse,
     description=(
-        "解析PDF简历文件，提取并结构化展示教育背景、技能栈、项目经历。"
-        "当你需要分析用户的简历内容时调用此工具。"
-        "输入应为PDF文件的完整本地路径。"
+        "����PDF�����ļ�����ȡ���ṹ��չʾ��������������ջ����Ŀ������"
+        "������Ҫ�����û��ļ�������ʱ���ô˹��ߡ�"
+        "����ӦΪPDF�ļ�����������·����"
     ),
 )
 
-# ═══════════════════════════════════════════════════════════════
-# 工具 3：简历匹配评分
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���� 3������ƥ������
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
-MATCH_SCORE_PROMPT = """你是一位资深HR和招聘专家。请分析以下简历与目标岗位JD的匹配度。
+MATCH_SCORE_PROMPT = """����һλ����HR����Ƹר�ҡ���������¼�����Ŀ���λJD��ƥ��ȡ�
 
-【目标岗位 JD】
+��Ŀ���λ JD��
 {jd_text}
 
-【求职者简历】
+����ְ�߼�����
 {resume_text}
 
-请返回严格格式的 JSON（不要包含其他文字）：
+�뷵���ϸ��ʽ�� JSON����Ҫ�����������֣���
 {{
     "score": 85,
-    "core_match": "匹配点1；匹配点2；匹配点3",
-    "missing_skills": "缺失技能1；缺失技能2；缺失技能3",
-    "improvement": "具体改进建议1；建议2；建议3"
+    "core_match": "ƥ���1��ƥ���2��ƥ���3",
+    "missing_skills": "ȱʧ����1��ȱʧ����2��ȱʧ����3",
+    "improvement": "����Ľ�����1������2������3"
 }}
 
-评分标准: 90-100 高度匹配，80-89 较匹配，70-79 部分匹配，<70 需显著提升。
-请客观评估，给出具体分数和详细分析。"""
+���ֱ�׼: 90-100 �߶�ƥ�䣬80-89 ��ƥ�䣬70-79 ����ƥ�䣬<70 ������������
+��͹����������������������ϸ������"""
 
 
 def _extract_json(text: str) -> dict:
     """
-    JSON 提取器兜底方案。
-    先用标准 json.loads 解析；失败后用大括号计数法查找完整 JSON；
-    再失败则返回原始文本标记。解决 LLM 在 JSON 前后添加额外文字的问题。
+    JSON ��ȡ�����׷�����
+    ���ñ�׼ json.loads ������ʧ�ܺ��ô����ż������������� JSON��
+    ��ʧ���򷵻�ԭʼ�ı���ǡ���� LLM �� JSON ǰ����Ӷ������ֵ����⡣
     """
-    # 尝试1: 直接解析
+    # ����1: ֱ�ӽ���
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 尝试2: 大括号计数提取
+    # ����2: �����ż�����ȡ
     try:
         brace_count = 0
         start_idx = -1
@@ -352,21 +406,21 @@ def _extract_json(text: str) -> dict:
     except (json.JSONDecodeError, IndexError):
         pass
 
-    # 尝试3: 兜底
+    # ����3: ����
     return {"raw_output": text, "score": "N/A", "parse_error": True}
 
 
 def _resume_match(jd_text: str) -> str:
     """
-    简历匹配评分工具。
-    输入: "JD:::\n{JD文本}\n\n简历:::\n{简历文本}"
-    输出: 匹配度得分、核心匹配点、缺失技能、改进方向
+    ����ƥ�����ֹ��ߡ�
+    ����: "JD:::\n{JD�ı�}\n\n����:::\n{�����ı�}"
+    ���: ƥ��ȵ÷֡�����ƥ��㡢ȱʧ���ܡ��Ľ�����
     """
     jd_content = ""
     resume_content = ""
 
-    if "简历:::" in jd_text:
-        parts = jd_text.split("简历:::", 1)
+    if "����:::" in jd_text:
+        parts = jd_text.split("����:::", 1)
         jd_content = parts[0].replace("JD:::", "").strip()
         resume_content = parts[1].strip() if len(parts) > 1 else ""
     else:
@@ -376,12 +430,12 @@ def _resume_match(jd_text: str) -> str:
 
     if not jd_content or not resume_content:
         return (
-            "❌ 请提供完整的 JD 和简历内容。\n"
-            "输入格式示例：\n"
-            "JD:::\n{岗位JD}\n\n简历:::\n{简历全文}"
+            "? ���ṩ������ JD �ͼ������ݡ�\n"
+            "�����ʽʾ����\n"
+            "JD:::\n{��λJD}\n\n����:::\n{����ȫ��}"
         )
 
-    # 智能截断：尽量保留完整的语义片段
+    # ���ܽضϣ�������������������Ƭ��
     jd_text = _smart_truncate(jd_content, max_chars=3000)
     resume_text = _smart_truncate(resume_content, max_chars=3000)
 
@@ -395,19 +449,19 @@ def _resume_match(jd_text: str) -> str:
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        return f"❌ LLM 调用失败: {e}\n请检查 API 配置后重试。"
+        return f"? LLM ����ʧ��: {e}\n���� API ���ú����ԡ�"
 
     result = _extract_json(content)
 
     if "parse_error" in result:
-        return f"⚠️ 评分结果格式异常，以下是 LLM 原始输出：\n\n{content}"
+        return f"?? ���ֽ����ʽ�쳣�������� LLM ԭʼ�����\n\n{content}"
 
     return (
-        f"📊 **简历匹配度评估**\n\n"
-        f"🎯 **匹配得分**: {result.get('score', 'N/A')} / 100\n\n"
-        f"✅ **核心匹配点**:\n{result.get('core_match', '未识别')}\n\n"
-        f"⚠️ **缺失技能**:\n{result.get('missing_skills', '未识别')}\n\n"
-        f"💡 **改进方向**:\n{result.get('improvement', '未识别')}"
+        f"?? **����ƥ�������**\n\n"
+        f"?? **ƥ��÷�**: {result.get('score', 'N/A')} / 100\n\n"
+        f"? **����ƥ���**:\n{result.get('core_match', 'δʶ��')}\n\n"
+        f"?? **ȱʧ����**:\n{result.get('missing_skills', 'δʶ��')}\n\n"
+        f"?? **�Ľ�����**:\n{result.get('improvement', 'δʶ��')}"
     )
 
 
@@ -415,61 +469,61 @@ resume_match_tool = Tool(
     name="resume_match",
     func=_resume_match,
     description=(
-        "评估简历与目标岗位JD的匹配度，输出百分制得分与改进建议。"
-        "输入格式: 'JD:::\n{JD全文}\n\n简历:::\n{简历全文}'"
+        "����������Ŀ���λJD��ƥ��ȣ�����ٷ��Ƶ÷���Ľ����顣"
+        "�����ʽ: 'JD:::\n{JDȫ��}\n\n����:::\n{����ȫ��}'"
     ),
 )
 
-# ═══════════════════════════════════════════════════════════════
-# 工具 4：简历优化（STAR法则）
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���� 4�������Ż���STAR����
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
-STAR_OPTIMIZE_PROMPT = """你是一位顶级简历优化专家，擅长用 STAR 法则改写经历。
+STAR_OPTIMIZE_PROMPT = """����һλ���������Ż�ר�ң��ó��� STAR �����д������
 
-STAR 法则：
-- S (Situation): 背景情境
-- T (Task): 任务目标
-- A (Action): 采取行动
-- R (Result): 量化成果
+STAR ����
+- S (Situation): �����龳
+- T (Task): ����Ŀ��
+- A (Action): ��ȡ�ж�
+- R (Result): �����ɹ�
 
-【Few-Shot 示例】
-优化前: "负责公司的数据分析工作，用Python做了一些报表"
-优化后: "[S]公司业务数据分散在多个系统，[T]为支撑运营决策需整合数据并产出日报，[A]独立搭建Python自动化数据管道，整合3个业务系统数据源，用Pandas完成清洗与建模，[R]日报产出效率提升70%，月均节省20人天人力成本"
+��Few-Shot ʾ����
+�Ż�ǰ: "����˾�����ݷ�����������Python����һЩ����"
+�Ż���: "[S]��˾ҵ�����ݷ�ɢ�ڶ��ϵͳ��[T]Ϊ֧����Ӫ�������������ݲ������ձ���[A]�����Python�Զ������ݹܵ�������3��ҵ��ϵͳ����Դ����Pandas�����ϴ�뽨ģ��[R]�ձ�����Ч������70%���¾���ʡ20���������ɱ�"
 
-【目标岗位 JD】
+��Ŀ���λ JD��
 {jd_text}
 
-【原始经历文本】
+��ԭʼ�����ı���
 {original_text}
 
-请严格按以下格式输出优化结果：
-1. 先输出改写后的简历描述（2-3个要点，每个要点包含完整的 STAR 结构）
-2. 在末尾附上「优化对比」表格，清晰标注改动点
+���ϸ����¸�ʽ����Ż������
+1. �������д��ļ���������2-3��Ҫ�㣬ÿ��Ҫ����������� STAR �ṹ��
+2. ��ĩβ���ϡ��Ż��Աȡ����������ע�Ķ���
 
-不要输出与优化无关的闲聊。"""
+��Ҫ������Ż��޹ص����ġ�"""
 
 
 def _resume_optimize(input_text: str) -> str:
     """
-    基于 STAR 法则优化简历经历描述。
-    输入: "岗位JD:::\n{JD}\n\n原始经历:::\n{经历文本}"
-    输出: 优化后文案 + 优化前后对比
+    ���� STAR �����Ż���������������
+    ����: "��λJD:::\n{JD}\n\nԭʼ����:::\n{�����ı�}"
+    ���: �Ż����İ� + �Ż�ǰ��Ա�
     """
     jd_text = ""
     original_text = ""
 
-    if "原始经历:::" in input_text:
-        parts = input_text.split("原始经历:::", 1)
-        jd_text = parts[0].replace("岗位JD:::", "").strip()
+    if "ԭʼ����:::" in input_text:
+        parts = input_text.split("ԭʼ����:::", 1)
+        jd_text = parts[0].replace("��λJD:::", "").strip()
         original_text = parts[1].strip() if len(parts) > 1 else ""
     else:
         jd_text = input_text[:500]
         original_text = input_text[500:]
 
     if not original_text:
-        return "❌ 请提供需要优化的经历描述文本。"
+        return "? ���ṩ��Ҫ�Ż��ľ��������ı���"
 
-    # 智能截断：尽量保留完整语义片段
+    # ���ܽضϣ�����������������Ƭ��
     jd_text = _smart_truncate(jd_text, max_chars=2500)
     original_text = _smart_truncate(original_text, max_chars=2500)
 
@@ -483,63 +537,63 @@ def _resume_optimize(input_text: str) -> str:
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        return f"❌ LLM 调用失败: {e}"
+        return f"? LLM ����ʧ��: {e}"
 
-    return f"✨ **STAR 法则简历优化**\n\n{content}"
+    return f"? **STAR ��������Ż�**\n\n{content}"
 
 
 resume_optimize_tool = Tool(
     name="resume_optimize",
     func=_resume_optimize,
     description=(
-        "使用 STAR 法则优化简历经历描述，突出量化成果。"
-        "输入格式: '岗位JD:::\n{JD}\n\n原始经历:::\n{经历}'"
+        "ʹ�� STAR �����Ż���������������ͻ�������ɹ���"
+        "�����ʽ: '��λJD:::\n{JD}\n\nԭʼ����:::\n{����}'"
     ),
 )
 
-# ═══════════════════════════════════════════════════════════════
-# 工具 5：面试题生成
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���� 5������������
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
-INTERVIEW_QUESTION_PROMPT = """你是一位资深技术面试官，请为以下岗位生成面试题。
+INTERVIEW_QUESTION_PROMPT = """����һλ��������Թ٣���Ϊ���¸�λ���������⡣
 
-【目标公司/岗位】
+��Ŀ�깫˾/��λ��
 {target}
 
-【面经知识库参考内容】
+���澭֪ʶ��ο����ݡ�
 {reference}
 
-请生成以下三类面试题（每类3-5道）：
-1. 🔧 技术题: 与岗位相关的专业技术问题
-2. 📁 项目题: 关于过往项目经历的深挖问题
-3. 💬 HR/行为题: 软技能、职业规划、团队协作类问题
+�������������������⣨ÿ��3-5������
+1. ?? ������: ���λ��ص�רҵ��������
+2. ?? ��Ŀ��: ���ڹ�����Ŀ��������������
+3. ?? HR/��Ϊ��: ����ܡ�ְҵ�滮���Ŷ�Э��������
 
-每道题请包含：
-- 题目本身
-- 考察点说明
-- 简要的答题思路提示
+ÿ�����������
+- ��Ŀ����
+- �����˵��
+- ��Ҫ�Ĵ���˼·��ʾ
 
-输出格式清晰，分类明确。"""
+�����ʽ������������ȷ��"""
 
 
 def _interview_question(target: str) -> str:
     """
-    生成模拟面试题，从面经知识库检索参考并结合LLM生成。
-    输入: 目标公司+岗位（如"字节跳动 数据分析实习"）
-    输出: 技术题、项目题、HR题 三类，每类3-5道
+    ����ģ�������⣬���澭֪ʶ������ο������LLM���ɡ�
+    ����: Ŀ�깫˾+��λ����"�ֽ����� ���ݷ���ʵϰ"��
+    ���: �����⡢��Ŀ�⡢HR�� ���࣬ÿ��3-5��
     """
     from modules.rag_knowledge import load_vector_store
     from config.settings import VECTOR_STORE_DIR
 
-    store_path = os.path.join(str(VECTOR_STORE_DIR), "jd_store")
-    reference_text = "未检索到面经参考材料。"
+    store_path = os.path.join(str(VECTOR_STORE_DIR), JD_STORE_NAME)
+    reference_text = "δ�������澭�ο����ϡ�"
 
     try:
         vector_store = load_vector_store(store_path)
         results = search_knowledge(vector_store, target, top_k=5)
-        if results and "检索异常" not in results[0].get("content", ""):
+        if results and "�����쳣" not in results[0].get("content", ""):
             reference_text = "\n\n".join(
-                [f"[来源: {r['source']}]\n{r['content']}" for r in results]
+                [f"[��Դ: {r['source']}]\n{r['content']}" for r in results]
             )
     except (FileNotFoundError, RuntimeError):
         pass
@@ -550,7 +604,7 @@ def _interview_question(target: str) -> str:
         return ch
 
     if not target.strip():
-        return "❌ 请提供目标公司和岗位信息，如「字节跳动 数据分析实习」。"
+        return "? ���ṩĿ�깫˾�͸�λ��Ϣ���硸�ֽ����� ���ݷ���ʵϰ����"
 
     prompt = INTERVIEW_QUESTION_PROMPT.format(
         target=target.strip(),
@@ -562,9 +616,9 @@ def _interview_question(target: str) -> str:
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        return f"❌ LLM 调用失败: {e}"
+        return f"? LLM ����ʧ��: {e}"
 
-    result = f"🎤 **模拟面试题生成** - {target}\n\n{content}"
+    result = f"?? **ģ������������** - {target}\n\n{content}"
     _cache_set(ck, result)
     return result
 
@@ -573,132 +627,134 @@ interview_question_tool = Tool(
     name="interview_question",
     func=_interview_question,
     description=(
-        "为目标岗位生成模拟面试题，包含技术题、项目题、HR题三类。"
-        "输入为目标公司+岗位，如'字节跳动 数据分析实习'。"
+        "ΪĿ���λ����ģ�������⣬���������⡢��Ŀ�⡢HR�����ࡣ"
+        "����ΪĿ�깫˾+��λ����'�ֽ����� ���ݷ���ʵϰ'��"
     ),
 )
 
-# ═══════════════════════════════════════════════════════════════
-# 工具函数：智能文本截断
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���ߺ����������ı��ض�
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
 def _smart_truncate(text: str, max_chars: int = 2500) -> str:
     """
-    智能截断文本，优先保留开头的关键信息和结尾的要求部分。
+    ���ܽض��ı������ȱ����ͷ�Ĺؼ���Ϣ�ͽ�β��Ҫ�󲿷֡�
     
-    策略：
-    - ≤ max_chars: 不截断
-    - > max_chars: 取开头 75% + 结尾 25%（因为 JD 的"任职要求"和"加分项"通常靠后）
+    ���ԣ�
+    - �� max_chars: ���ض�
+    - > max_chars: ȡ��ͷ 75% + ��β 25%����Ϊ JD ��"��ְҪ��"��"�ӷ���"ͨ������
     """
     if len(text) <= max_chars:
         return text
     
+    # Note: uses char count, not token count. Chinese ~1.5 chars/token,
+    # so max_chars=2500 gives ~1500 tokens headroom (well within limits).
     head_size = int(max_chars * 0.75)
-    tail_size = max_chars - head_size - 50  # 留 50 字符给分隔符
+    tail_size = max_chars - head_size - 50  # �� 50 �ַ����ָ��
     
     head = text[:head_size]
     tail = text[-tail_size:]
     
-    return head + "\n\n...(中间部分已省略)...\n\n" + tail
+    return head + "\n\n...(�м䲿����ʡ��)...\n\n" + tail
 
 
-# ═══════════════════════════════════════════════════════════════
-# 工具 6：投递进度管理
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���� 6��Ͷ�ݽ��ȹ���
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
 def _application_tracker(command: str) -> str:
     """
-    投递进度管理：支持自然语言指令操作 CSV 投递记录。
-    通过关键词识别指令类型（新增/查询/更新/删除），纯规则匹配保证响应速度。
+    Ͷ�ݽ��ȹ����֧����Ȼ����ָ����� CSV Ͷ�ݼ�¼��
+    ͨ���ؼ���ʶ��ָ�����ͣ�����/��ѯ/����/ɾ������������ƥ�䱣֤��Ӧ�ٶȡ�
 
-    输入示例:
-    - "新增 字节跳动 数据分析实习 2025-03-15 已投递 内推"
-    - "查询"
-    - "更新 1 面试中"
-    - "删除 2"
+    ����ʾ��:
+    - "���� �ֽ����� ���ݷ���ʵϰ 2025-03-15 ��Ͷ�� ����"
+    - "��ѯ"
+    - "���� 1 ������"
+    - "ɾ�� 2"
     """
     cmd = command.strip()
 
     if not APPLICATIONS_CSV.exists():
-        APPLICATIONS_CSV.write_text("公司,岗位,投递日期,状态,备注\n", encoding="utf-8")
+        APPLICATIONS_CSV.write_text("��˾,��λ,Ͷ������,״̬,��ע\n", encoding="utf-8")
 
     try:
         df = pd.read_csv(APPLICATIONS_CSV, encoding="utf-8")
     except Exception:
-        df = pd.DataFrame(columns=["公司", "岗位", "投递日期", "状态", "备注"])
+        df = pd.DataFrame(columns=["��˾", "��λ", "Ͷ������", "״̬", "��ע"])
 
-    # ── 查询 ──
-    if cmd.startswith("查询") or cmd.startswith("查看"):
+    # ���� ��ѯ ����
+    if cmd.startswith("��ѯ") or cmd.startswith("�鿴"):
         if df.empty:
-            return "📭 当前无投递记录。使用「新增」命令添加第一条记录吧！"
-        output = ["📋 **投递进度总览**\n"]
+            return "?? ��ǰ��Ͷ�ݼ�¼��ʹ�á�������������ӵ�һ����¼�ɣ�"
+        output = ["?? **Ͷ�ݽ�������**\n"]
         for idx, row in df.iterrows():
             output.append(
-                f"#{idx+1} | 🏢 {row['公司']} | 💼 {row['岗位']} | "
-                f"📅 {row['投递日期']} | 📌 {row['状态']} | 📝 {row.get('备注', '')}"
+                f"#{idx+1} | ?? {row['��˾']} | ?? {row['��λ']} | "
+                f"?? {row['Ͷ������']} | ?? {row['״̬']} | ?? {row.get('��ע', '')}"
             )
         return "\n".join(output)
 
-    # ── 新增 ──
-    if cmd.startswith("新增"):
-        parts = cmd.replace("新增", "", 1).strip().split(maxsplit=4)
+    # ���� ���� ����
+    if cmd.startswith("����"):
+        parts = cmd.replace("����", "", 1).strip().split(maxsplit=4)
         if len(parts) < 3:
             return (
-                "❌ 格式错误。正确格式：新增 公司名 岗位 投递日期 状态 [备注]\n"
-                "示例：新增 字节跳动 数据分析实习 2025-03-15 已投递 内推"
+                "? ��ʽ������ȷ��ʽ������ ��˾�� ��λ Ͷ������ ״̬ [��ע]\n"
+                "ʾ�������� �ֽ����� ���ݷ���ʵϰ 2025-03-15 ��Ͷ�� ����"
             )
         company = parts[0]
         position = parts[1]
         date = parts[2]
-        status = parts[3] if len(parts) > 3 else "已投递"
+        status = parts[3] if len(parts) > 3 else "��Ͷ��"
         note = parts[4] if len(parts) > 4 else ""
 
         new_row = pd.DataFrame([{
-            "公司": company, "岗位": position,
-            "投递日期": date, "状态": status, "备注": note,
+            "��˾": company, "��λ": position,
+            "Ͷ������": date, "״̬": status, "��ע": note,
         }])
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(APPLICATIONS_CSV, index=False, encoding="utf-8")
-        return f"✅ 已新增投递记录：{company} - {position}"
+        return f"? ������Ͷ�ݼ�¼��{company} - {position}"
 
-    # ── 更新 ──
-    if cmd.startswith("更新"):
-        parts = cmd.replace("更新", "", 1).strip().split(maxsplit=1)
+    # ���� ���� ����
+    if cmd.startswith("����"):
+        parts = cmd.replace("����", "", 1).strip().split(maxsplit=1)
         if len(parts) < 2:
-            return "❌ 格式错误。正确格式：更新 序号 新状态\n示例：更新 1 面试中"
+            return "? ��ʽ������ȷ��ʽ������ ��� ��״̬\nʾ�������� 1 ������"
         try:
             idx = int(parts[0]) - 1
         except ValueError:
-            return "❌ 序号必须为数字。"
+            return "? ��ű���Ϊ���֡�"
         if idx < 0 or idx >= len(df):
-            return f"❌ 序号超出范围（共 {len(df)} 条记录）。"
-        df.at[idx, "状态"] = parts[1]
+            return f"? ��ų�����Χ���� {len(df)} ����¼����"
+        df.at[idx, "״̬"] = parts[1]
         df.to_csv(APPLICATIONS_CSV, index=False, encoding="utf-8")
-        return f"✅ 已更新 #{idx+1} 状态为：{parts[1]}"
+        return f"? �Ѹ��� #{idx+1} ״̬Ϊ��{parts[1]}"
 
-    # ── 删除 ──
-    if cmd.startswith("删除"):
-        parts = cmd.replace("删除", "", 1).strip().split()
+    # ���� ɾ�� ����
+    if cmd.startswith("ɾ��"):
+        parts = cmd.replace("ɾ��", "", 1).strip().split()
         if not parts:
-            return "❌ 格式错误。正确格式：删除 序号\n示例：删除 1"
+            return "? ��ʽ������ȷ��ʽ��ɾ�� ���\nʾ����ɾ�� 1"
         try:
             idx = int(parts[0]) - 1
         except ValueError:
-            return "❌ 序号必须为数字。"
+            return "? ��ű���Ϊ���֡�"
         if idx < 0 or idx >= len(df):
-            return f"❌ 序号超出范围（共 {len(df)} 条记录）。"
+            return f"? ��ų�����Χ���� {len(df)} ����¼����"
         removed = df.iloc[idx]
         df = df.drop(idx).reset_index(drop=True)
         df.to_csv(APPLICATIONS_CSV, index=False, encoding="utf-8")
-        return f"✅ 已删除投递记录 #{idx+1}：{removed['公司']} - {removed['岗位']}"
+        return f"? ��ɾ��Ͷ�ݼ�¼ #{idx+1}��{removed['��˾']} - {removed['��λ']}"
 
-    # ── 兜底 ──
+    # ���� ���� ����
     return (
-        "❓ 无法识别的指令。支持以下操作：\n"
-        "  • 新增 公司 岗位 日期 状态 [备注]\n"
-        "  • 查询（查看全部）\n"
-        "  • 更新 序号 新状态\n"
-        "  • 删除 序号"
+        "? �޷�ʶ���ָ�֧�����²�����\n"
+        "  ? ���� ��˾ ��λ ���� ״̬ [��ע]\n"
+        "  ? ��ѯ���鿴ȫ����\n"
+        "  ? ���� ��� ��״̬\n"
+        "  ? ɾ�� ���"
     )
 
 
@@ -706,15 +762,15 @@ application_tracker_tool = Tool(
     name="application_tracker",
     func=_application_tracker,
     description=(
-        "管理实习投递进度记录，支持新增、查询、更新状态、删除操作。"
-        "输入格式: '新增 公司 岗位 日期 状态' / '查询' / '更新 序号 新状态' / '删除 序号'"
+        "����ʵϰͶ�ݽ��ȼ�¼��֧����������ѯ������״̬��ɾ��������"
+        "�����ʽ: '���� ��˾ ��λ ���� ״̬' / '��ѯ' / '���� ��� ��״̬' / 'ɾ�� ���'"
     ),
 )
 
 
-# ═══════════════════════════════════════════════════════════════
-# 工具集合导出
-# ═══════════════════════════════════════════════════════════════
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
+# ���߼��ϵ���
+# �T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T�T
 
 ALL_TOOLS = [
     job_search_tool,

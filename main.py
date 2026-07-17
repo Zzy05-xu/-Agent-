@@ -321,7 +321,7 @@ with tab1:
                 status_placeholder.markdown("🤔 *Agent 正在思考...*")
 
                 try:
-                    for event in run_agent_streaming(user_input, chat_history=lc_history, session_id="default"):
+                    for event in run_agent_streaming(user_input, chat_history=lc_history):
                         if event["type"] == "tool_start":
                             status_placeholder.markdown(
                                 f'<div class="thinking-box">🔧 正在调用: **{event["tool"]}**</div>',
@@ -378,7 +378,7 @@ with tab1:
         else:
             # 非流式模式
             with st.spinner("🤔 Agent 正在思考..."):
-                result = run_agent(user_input, chat_history=lc_history, session_id="default")
+                result = run_agent(user_input, chat_history=lc_history)
                 answer = result["output"]
                 steps = result.get("intermediate_steps", [])
 
@@ -540,7 +540,7 @@ with tab4:
     def load_applications():
         try:
             if APPLICATIONS_CSV.exists():
-                df = pd.read_csv(APPLICATIONS_CSV, encoding="utf-8")
+                df = pd.read_csv(APPLICATIONS_CSV, encoding="utf-8", dtype=str)
                 if df.empty:
                     df = pd.DataFrame(columns=["公司", "岗位", "投递日期", "状态", "备注"])
                 return df
@@ -649,13 +649,28 @@ with tab4:
         key="app_table_editor",
     )
 
-    col_save, col_export = st.columns([1, 1])
+    
+    col_save, col_delete, col_export = st.columns([1, 1, 1])
     with col_save:
         if st.button("💾 保存修改", type="primary", use_container_width=True):
             save_df = edited_df.drop(columns=["序号"], errors="ignore")
+            save_df = save_df[save_df["公司"].astype(str).str.strip() != ""]
             save_df.to_csv(APPLICATIONS_CSV, index=False, encoding="utf-8")
             st.success("✅ 投递记录已保存！")
             st.rerun()
+    with col_delete:
+        delete_idx = st.number_input("删除行号", min_value=1, max_value=max(len(df), 1), step=1, key="del_row")
+        if st.button("🗑️ 确认删除", type="secondary", use_container_width=True):
+            if df.empty:
+                st.warning("⚠️ 暂无投递记录")
+            elif delete_idx > len(df):
+                st.warning(f"⚠️ 行号超出 ({len(df)} 条)")
+            else:
+                removed = df.iloc[delete_idx - 1]
+                df = df.drop(delete_idx - 1).reset_index(drop=True)
+                df.to_csv(APPLICATIONS_CSV, index=False, encoding="utf-8")
+                st.success(f"✅ 已删除: {removed['公司']} - {removed['岗位']}")
+                st.rerun()
     with col_export:
         if not df.empty:
             csv_data = df.drop(columns=["序号"], errors="ignore").to_csv(index=False, encoding="utf-8-sig")
